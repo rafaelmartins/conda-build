@@ -706,14 +706,13 @@ def get_cran_archive_versions(cran_url, session, package, verbose=True):
 def get_cran_index(cran_url, session, verbose=True):
     if verbose:
         print("Fetching main index from %s" % cran_url)
-    r = session.get(cran_url + "/src/contrib/PACKAGES.gz")
+    r = session.get(cran_url + "/src/contrib/?C=M;O=A")
     r.raise_for_status()
     records = {}
-    for line in gzip.decompress(r.content).decode("utf-8", errors="replace").splitlines():
-        if line.startswith("Package: "):
-            package = line.rstrip().split(" ", 1)[1]
-        elif line.startswith("Version: "):
-            records[package.lower()] = (package, line.rstrip().split(" ", 1)[1])
+    for p in re.findall(r'<td><a href="([^"]+)">\1</a></td>', r.text):
+        if p.endswith('.tar.gz') and '_' in p:
+            name, version = p.rsplit('.', 2)[0].split('_', 1)
+            records[name.lower()] = (name, version)
     r = session.get(cran_url + "/src/contrib/Archive/")
     r.raise_for_status()
     for p in re.findall(r'<td><a href="([^"]+)/">\1/</a></td>', r.text):

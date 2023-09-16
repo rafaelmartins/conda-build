@@ -7,6 +7,7 @@ Tools for converting Cran packages to conda recipes.
 
 import argparse
 import copy
+import gzip
 import hashlib
 import re
 import subprocess
@@ -66,6 +67,7 @@ CRAN_META = """\
 {version_source}
 {version_binary1}
 {version_binary2}
+{cran_mirror_fixed}
 
 {{% set posix = 'm2-' if win else '' %}}
 {{% set native = 'm2w64-' if win else '' %}}
@@ -329,7 +331,7 @@ def add_parser(repos):
     )
     cran.add_argument(
         "packages",
-        nargs="+",
+        nargs="*",
         help="""CRAN packages to create recipe skeletons for.""",
     )
     cran.add_argument(
@@ -365,6 +367,14 @@ def add_parser(repos):
         help="URL to use for as source package repository",
     )
     cran.add_argument(
+        "--fix-cran-url",
+        action="store_true",
+        dest="fix_cran_url",
+        help="""Hardcode the URL of the cran mirror into the recipe.
+                Normally it is represented as Jinja2 variable "cran_mirror"
+                that can be adjusted with the variant file.""",
+    )
+    cran.add_argument(
         "--r-interp",
         default="r-base",
         help="Declare R interpreter package",
@@ -395,6 +405,13 @@ def add_parser(repos):
         "--use-rtools-win",
         action="store_true",
         help="Use Rtools when building from source on Windows",
+    )
+    cran.add_argument(
+        "--fetch-all",
+        action="store_true",
+        dest="fetch_all",
+        help="""Build recipes for all packages found in the main index.
+                Use with care! This is obviously quite slow.""",
     )
     cran.add_argument(
         "--recursive",
@@ -689,13 +706,14 @@ def get_cran_archive_versions(cran_url, session, package, verbose=True):
 def get_cran_index(cran_url, session, verbose=True):
     if verbose:
         print("Fetching main index from %s" % cran_url)
-    r = session.get(cran_url + "/src/contrib/")
+    r = session.get(cran_url + "/src/contrib/PACKAGES.gz")
     r.raise_for_status()
     records = {}
-    for p in re.findall(r'<td><a href="([^"]+)">\1</a></td>', r.text):
-        if p.endswith(".tar.gz") and "_" in p:
-            name, version = p.rsplit(".", 2)[0].split("_", 1)
-            records[name.lower()] = (name, version)
+    for line in gzip.decompress(r.content).decode("utf-8", errors="replace").splitlines():
+        if line.startswith("Package: "):
+            package = line.rstrip().split(" ", 1)[1]
+        elif line.startswith("Version: "):
+            records[package.lower()] = (package, line.rstrip().split(" ", 1)[1])
     r = session.get(cran_url + "/src/contrib/Archive/")
     r.raise_for_status()
     for p in re.findall(r'<td><a href="([^"]+)/">\1/</a></td>', r.text):
@@ -875,6 +893,8 @@ def skeletonize(
     allow_archived=False,
     add_cross_r_base=False,
     no_comments=False,
+    fetch_all=False,
+    fix_cran_url=False,
 ):
     if (
         use_when_no_binary != "error"
@@ -897,20 +917,24 @@ def skeletonize(
         cran_url = ensure_list(
             _variant.get("cran_mirror", DEFAULT_VARIANTS["cran_mirror"])
         )[0]
-
-    if len(in_packages) > 1 and version_compare:
-        raise ValueError("--version-compare only works with one package at a time")
-    if update_policy == "error" and not in_packages:
-        raise ValueError("At least one package must be supplied")
-
-    package_dicts = {}
-    package_list = []
-
     cran_url = cran_url.rstrip("/")
-
     # Get cran index lazily so we don't have to go to CRAN
     # for a github repo or a local tarball
     cran_index = None
+
+    if len(in_packages) > 1 and version_compare:
+        raise ValueError("--version-compare only works with one package at a time")
+    if update_policy == "error" and not in_packages and not fetch_all:
+        raise ValueError("At least one package must be supplied")
+    if fetch_all:
+        if in_packages:
+            raise ValueError("Must not supply any explicit packages with --fetch-all")
+        session = get_session(output_dir)
+        cran_index = get_cran_index(cran_url, session)
+        in_packages = list(key for key, (_, version) in cran_index.items() if version)
+
+    package_dicts = {}
+    package_list = []
 
     cran_layout_template = {
         "source": {
@@ -1070,8 +1094,11 @@ def skeletonize(
                 "summary": "",
                 "binary1": "",
                 "binary2": "",
+                "cran_mirror_fixed": "",
             }
         )
+        if fix_cran_url:
+            d["cran_mirror_fixed"] = "{% set cran_mirror = '" + cran_url + "' %}"
 
         if version_compare:
             sys.exit(not version_compare(dir_path, d["conda_version"]))
@@ -1344,6 +1371,8 @@ def skeletonize(
             d["home_comment"] = ""
             if is_github_url:
                 d["homeurl"] = f" {location}"
+            elif fix_cran_url:
+                d["homeurl"] = " {}/html/{}.html".format(cran_url, package)
             else:
                 d["homeurl"] = f" https://CRAN.R-project.org/package={package}"
 
